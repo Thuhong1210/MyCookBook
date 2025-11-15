@@ -1,566 +1,593 @@
 from flask import render_template, url_for, flash, redirect, request, session
-from mycookbook import app, mongo
+from mycookbook import app, db
 from werkzeug.security import generate_password_hash, check_password_hash
 from mycookbook.forms import RegisterForm, LoginForm, \
     ChangeUsernameForm, ChangePasswordForm, Add_RecipeForm
-from flask_pymongo import pymongo
-from bson.objectid import ObjectId
 import math
+import json
 
-# MongoDB Collections variables
-users_coll = mongo.db.users
-recipes_coll = mongo.db.recipes
-cuisines_coll = mongo.db.cuisines
-diets_coll = mongo.db.diets
-meals_coll = mongo.db.meals
-
-
-'''
-HOME PAGE
-'''
+# ------------------------------------------------
+# HELPER: GET DB CONNECTION
+# ------------------------------------------------
+def get_conn():
+    return db.get_connection()
 
 
+# ------------------------------------------------
+# HOME PAGE
+# ------------------------------------------------
 @app.route('/')
-@app.route("/home")
+@app.route('/home')
 def home():
-    '''
-    Main home page.
-    Allows users to view 4 random featured recipes
-    from the database as clickable cards, located bellow the hero image.
-    '''
-    # Generate 4 random recipes from the DB
-    featured_recipes = ([recipe for recipe in recipes_coll.aggregate
-                        ([{"$sample": {"size": 4}}])])
-    return render_template('home.html', featured_recipes=featured_recipes,
-                           title='Home')
+    conn = get_conn()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("SELECT * FROM recipes ORDER BY RAND() LIMIT 4")
+    featured_recipes = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    return render_template('home.html', featured_recipes=featured_recipes, title="Home")
 
 
-'''
-RECIPES ROUTES
-'''
-
-
-# All recipes display
+# ------------------------------------------------
+# ALL RECIPES
+# ------------------------------------------------
 @app.route('/all_recipes')
 def all_recipes():
-    '''
-    READ.
-    Displays all the recipes from the database using pagination.
-    The limit is set to 8 recipes per page.
-    Also displayes the number of all recipes.
-    '''
-    # CREDITS: the idea of pagination used below is taken and modified
-    # from the Shane Muirhead's project
+    conn = get_conn()
+    cursor = conn.cursor(dictionary=True)
+
     limit_per_page = 8
     current_page = int(request.args.get('current_page', 1))
-    # get total of all the recipes in db
-    number_of_all_rec = recipes_coll.count()
+
+    cursor.execute("SELECT COUNT(*) AS total FROM recipes")
+    number_of_all_rec = cursor.fetchone()['total']
+
     pages = range(1, int(math.ceil(number_of_all_rec / limit_per_page)) + 1)
-    recipes = recipes_coll.find().sort('_id', pymongo.ASCENDING).skip(
-        (current_page - 1)*limit_per_page).limit(limit_per_page)
 
-    return render_template("all_recipes.html", recipes=recipes,
-                           title='All Recipes', current_page=current_page,
-                           pages=pages, number_of_all_rec=number_of_all_rec)
+    cursor.execute("""
+        SELECT * FROM recipes ORDER BY id ASC
+        LIMIT %s OFFSET %s
+    """, (limit_per_page, (current_page - 1) * limit_per_page))
+    recipes = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    return render_template(
+        "all_recipes.html",
+        recipes=recipes,
+        title="All Recipes",
+        current_page=current_page,
+        pages=pages,
+        number_of_all_rec=number_of_all_rec
+    )
 
 
-# Single Recipe details display
+# ------------------------------------------------
+# SINGLE RECIPE DETAILS
+# ------------------------------------------------
 @app.route('/recipe_details/<recipe_id>')
 def single_recipe_details(recipe_id):
-    '''
-    READ.
-    Displays detailed information about a selected recipe.
-    If logged id user is an author of the selected recipe,
-    there are buttons "edit" and "delete" displayed
-    giving the oportunity to manipulate the recipe.
-    '''
-    # find the selected recipe in DB by its id
-    selected_recipe = recipes_coll.find_one({"_id": ObjectId(recipe_id)})
-    # Set the author of the recipe
-    author = users_coll.find_one(
-        {"_id": ObjectId(selected_recipe.get("author"))})["username"]
+    conn = get_conn()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("SELECT * FROM recipes WHERE id=%s", (recipe_id,))
+    selected_recipe = cursor.fetchone()
+
+    cursor.execute("SELECT username FROM users WHERE id=%s", (selected_recipe['author'],))
+    author = cursor.fetchone()['username']
+
+    cursor.close()
+    conn.close()
+
     return render_template("single_recipe_details.html",
-                           selected_recipe=selected_recipe, author=author,
+                           selected_recipe=selected_recipe,
+                           author=author,
                            title='Recipe Details')
 
 
-# My recipes
+# ------------------------------------------------
+# MY RECIPES
+# ------------------------------------------------
 @app.route('/my_recipes/<username>')
 def my_recipes(username):
-    '''
-    READ.
-    Displays the recipes created by logged in user in session.
-    If user has not created any recipes yet, there's a button "add recipe"
-    giving an opportunity to create a new recipe.
-    Pagination is in place diplaying 8 recipes per page.
-    Also displays the total number of recipes created by the user.
-    '''
-    my_id = users_coll.find_one({'username': session['username']})['_id']
-    my_username = users_coll.find_one({'username': session
-                                      ['username']})['username']
-    # finds all user's recipes by author id
-    my_recipes = recipes_coll.find({'author': my_id})
-    # get total number of recipes created by the user
-    number_of_my_rec = my_recipes.count()
-    # Pagination, displays 8 recipes per page
-    # CREDITS: the idea of pagination used below is taken and modified
-    # from the Shane Muirhead's project
+    if 'username' not in session:
+        flash('You must be logged in!')
+        return redirect(url_for('home'))
+
+    conn = get_conn()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("SELECT id FROM users WHERE username=%s", (session['username'],))
+    user_id = cursor.fetchone()['id']
+
+    cursor.execute("SELECT COUNT(*) AS total FROM recipes WHERE author=%s", (user_id,))
+    number_of_my_rec = cursor.fetchone()['total']
+
     limit_per_page = 8
     current_page = int(request.args.get('current_page', 1))
     pages = range(1, int(math.ceil(number_of_my_rec / limit_per_page)) + 1)
-    recipes = my_recipes.sort('_id', pymongo.ASCENDING).skip(
-        (current_page - 1)*limit_per_page).limit(limit_per_page)
 
-    return render_template("my_recipes.html", my_recipes=my_recipes,
-                           username=my_username, recipes=recipes,
+    cursor.execute("""
+        SELECT * FROM recipes WHERE author=%s
+        ORDER BY id ASC
+        LIMIT %s OFFSET %s
+    """, (user_id, limit_per_page, (current_page - 1) * limit_per_page))
+    recipes = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    return render_template("my_recipes.html",
+                           username=username,
+                           recipes=recipes,
                            number_of_my_rec=number_of_my_rec,
-                           current_page=current_page, pages=pages,
+                           current_page=current_page,
+                           pages=pages,
                            title='My Recipes')
 
 
-# Add recipe
+# ------------------------------------------------
+# ADD RECIPE
+# ------------------------------------------------
 @app.route('/add_recipe')
 def add_recipe():
-    '''
-    CREATE.
-    The function calls Add_RecipeForm class from forms.py
-    to diplay the form for adding new recipe,
-    fill dropdowns with data from cuisins, diets and meals collections.
-    Only logged in users can view and fill the form
-    '''
-    # prevents guest users from viewing the form
     if 'username' not in session:
-        flash('You must be logged in to add a new recipe!')
+        flash('You must be logged in to add a recipe!')
         return redirect(url_for('home'))
-    # form variable to initialise the form
+
     form = Add_RecipeForm()
-    # variables to fill dropdownes with data from collections
-    diet_types = diets_coll.find()
-    meal_types = meals_coll.find()
-    cuisine_types = cuisines_coll.find()
-    return render_template("add_recipe.html", diet_types=diet_types,
-                           cuisine_types=cuisine_types, meal_types=meal_types,
-                           form=form, title='New Recipe')
+
+    conn = get_conn()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("SELECT * FROM diets")
+    diet_types = cursor.fetchall()
+
+    cursor.execute("SELECT * FROM meals")
+    meal_types = cursor.fetchall()
+
+    cursor.execute("SELECT * FROM cuisines")
+    cuisine_types = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    return render_template("add_recipe.html",
+                           diet_types=diet_types,
+                           cuisine_types=cuisine_types,
+                           meal_types=meal_types,
+                           form=form,
+                           title='New Recipe')
 
 
-# Insert recipe
-@app.route("/insert_recipe", methods=['GET', 'POST'])
+# ------------------------------------------------
+# INSERT RECIPE
+# ------------------------------------------------
+@app.route("/insert_recipe", methods=['POST'])
 def insert_recipe():
-    '''
-    CREATE.
-    Inserts new created recipe to the "recipes" collection in DB
-    after submission the form from the add_recipe page.
-    '''
-
-    # split ingredients and directions into lists
-    ingredients = request.form.get("ingredients").splitlines()
-    directions = request.form.get("recipe_directions").splitlines()
-    # identifies the user in session to assign an author for new recipe
-    author = users_coll.find_one({"username": session["username"]})["_id"]
-
     if request.method == 'POST':
-        # inser the new recipe after submission the form
-        new_recipe = {
-            "recipe_name": request.form.get("recipe_name").strip(),
-            "description": request.form.get("recipe_description"),
-            "cuisine_type": request.form.get("cuisine_type"),
-            "meal_type": request.form.get("meal_type"),
-            "diet_type": request.form.get("diet_type"),
-            "cooking_time": request.form.get("cooking_time"),
-            "servings": request.form.get("servings"),
-            "ingredients": ingredients,
-            "directions": directions,
-            'author': author,
-            "image": request.form.get("image")
-        }
-        insert_recipe_intoDB = recipes_coll.insert_one(new_recipe)
-        # updates "user recipes" list with recipe_id added in user collection
-        users_coll.update_one(
-            {"_id": ObjectId(author)},
-            {"$push": {"user_recipes": insert_recipe_intoDB.inserted_id}})
-        flash('Your recipe  was succsessfully added!')
-        return redirect(url_for(
-            "single_recipe_details",
-            recipe_id=insert_recipe_intoDB.inserted_id))
+
+        ingredients = json.dumps(request.form.get("ingredients").splitlines())
+        directions = json.dumps(request.form.get("recipe_directions").splitlines())
+
+        conn = get_conn()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute("SELECT id FROM users WHERE username=%s", (session["username"],))
+        author_id = cursor.fetchone()['id']
+
+        cursor.execute("""
+            INSERT INTO recipes (
+                recipe_name, description, cuisine_type, meal_type,
+                diet_type, cooking_time, servings, ingredients, directions,
+                author, image
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            request.form.get("recipe_name").strip(),
+            request.form.get("recipe_description"),
+            request.form.get("cuisine_type"),
+            request.form.get("meal_type"),
+            request.form.get("diet_type"),
+            request.form.get("cooking_time"),
+            request.form.get("servings"),
+            ingredients,
+            directions,
+            author_id,
+            request.form.get("image"),
+        ))
+
+        conn.commit()
+        recipe_id = cursor.lastrowid
+
+        cursor.close()
+        conn.close()
+
+        flash("Recipe added successfully!")
+        return redirect(url_for("single_recipe_details", recipe_id=recipe_id))
 
 
-# Edit Recipe
+# ------------------------------------------------
+# EDIT RECIPE
+# ------------------------------------------------
 @app.route("/edit_recipe/<recipe_id>")
 def edit_recipe(recipe_id):
-    '''
-    UPDATE.
-    Renders edit_recipe page, provides the user with a form to edit task
-    with pre-populated fields.
-    '''
-    # prevents guest users from viewing the form
     if 'username' not in session:
-        flash('You must be logged in to edit a recipe!')
-        return redirect(url_for('home'))
-    user_in_session = users_coll.find_one({'username': session['username']})
-    # get the selected recipe for filling the fields
-    selected_recipe = recipes_coll.find_one({"_id": ObjectId(recipe_id)})
-    # allows only author of the recipe to edit it;
-    # protects againts brute-forcing
-    if selected_recipe['author'] == user_in_session['_id']:
-        # variables to fill dropdownes with data from collections
-        diet_types = diets_coll.find()
-        meal_types = meals_coll.find()
-        cuisine_types = cuisines_coll.find()
-        return render_template('edit_recipe.html',
-                               selected_recipe=selected_recipe,
-                               cuisine_types=cuisine_types,
-                               diet_types=diet_types,
-                               meal_types=meal_types, title='Edit Recipe')
-    else:
+        flash("You must be logged in to edit recipes!")
+        return redirect(url_for("home"))
+
+    conn = get_conn()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("SELECT id FROM users WHERE username=%s", (session['username'],))
+    user_id = cursor.fetchone()['id']
+
+    cursor.execute("SELECT * FROM recipes WHERE id=%s", (recipe_id,))
+    selected_recipe = cursor.fetchone()
+
+    if selected_recipe['author'] != user_id:
         flash("You can only edit your own recipes!")
         return redirect(url_for('home'))
 
+    cursor.execute("SELECT * FROM diets")
+    diet_types = cursor.fetchall()
 
-# Update Recipe in the Database
+    cursor.execute("SELECT * FROM meals")
+    meal_types = cursor.fetchall()
+
+    cursor.execute("SELECT * FROM cuisines")
+    cuisine_types = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    return render_template("edit_recipe.html",
+                           selected_recipe=selected_recipe,
+                           diet_types=diet_types,
+                           meal_types=meal_types,
+                           cuisine_types=cuisine_types,
+                           title='Edit Recipe')
+
+
+# ------------------------------------------------
+# UPDATE RECIPE
+# ------------------------------------------------
 @app.route("/update_recipe/<recipe_id>", methods=["POST"])
 def update_recipe(recipe_id):
-    '''
-    UPDATE.
-    Updates the selected recipe in the database after submission the form.
-    '''
-    recipes = recipes_coll
+    conn = get_conn()
+    cursor = conn.cursor()
 
-    selected_recipe = recipes_coll.find_one({"_id": ObjectId(recipe_id)})
-    # identifies the user in session to assign an author for edited recipe
-    author = selected_recipe.get("author")
-    # split ingredients and directions into lists
-    ingredients = request.form.get("ingredients").splitlines()
-    directions = request.form.get("directions").splitlines()
-    if request.method == "POST":
-        # updates the selected recipe with data gotten from the form
-        recipes.update({"_id": ObjectId(recipe_id)}, {
-            "recipe_name": request.form.get("recipe_name"),
-            "description": request.form.get("recipe_description"),
-            "cuisine_type": request.form.get("cuisine_type"),
-            "meal_type": request.form.get("meal_type"),
-            "cooking_time": request.form.get("cooking_time"),
-            "diet_type": request.form.get("diet_type"),
-            "servings": request.form.get("servings"),
-            "ingredients": ingredients,
-            "directions": directions,
-            'author': author,
-            "image": request.form.get("recipe_image")
-        })
-        return redirect(url_for("single_recipe_details",
-                                recipe_id=recipe_id))
+    ingredients = json.dumps(request.form.get("ingredients").splitlines())
+    directions = json.dumps(request.form.get("directions").splitlines())
+
+    cursor.execute("""
+        UPDATE recipes SET
+            recipe_name=%s,
+            description=%s,
+            cuisine_type=%s,
+            meal_type=%s,
+            cooking_time=%s,
+            diet_type=%s,
+            servings=%s,
+            ingredients=%s,
+            directions=%s,
+            image=%s
+        WHERE id=%s
+    """, (
+        request.form.get("recipe_name"),
+        request.form.get("recipe_description"),
+        request.form.get("cuisine_type"),
+        request.form.get("meal_type"),
+        request.form.get("cooking_time"),
+        request.form.get("diet_type"),
+        request.form.get("servings"),
+        ingredients,
+        directions,
+        request.form.get("recipe_image"),
+        recipe_id
+    ))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return redirect(url_for("single_recipe_details", recipe_id=recipe_id))
 
 
-# Delete Recipe
+# ------------------------------------------------
+# DELETE RECIPE
+# ------------------------------------------------
 @app.route("/delete_recipe/<recipe_id>")
 def delete_recipe(recipe_id):
-    '''
-    DELETE.
-    Removes the selected recipe from the database.
-    Only the author of the recipe can delete the recipe.
-    '''
-    # prevents guest users from viewing the modal
     if 'username' not in session:
-        flash('You must be logged in to delete a recipe!')
-        return redirect(url_for('home'))
-    user_in_session = users_coll.find_one({'username': session['username']})
-    # get the selected recipe for filling the fields
-    selected_recipe = recipes_coll.find_one({"_id": ObjectId(recipe_id)})
-    # allows only author of the recipe to delete it;
-    # protects againts brute-forcing
-    if selected_recipe['author'] == user_in_session['_id']:
-        recipes_coll.remove({"_id": ObjectId(recipe_id)})
-        # find the author of the selected recipe
-        author = users_coll.find_one({'username': session['username']})['_id']
-
-        users_coll.update_one({"_id": ObjectId(author)},
-                              {"$pull": {"user_recipes": ObjectId(recipe_id)}})
-        flash('Your recipe has been deleted.')
+        flash("You must be logged in!")
         return redirect(url_for("home"))
-    else:
+
+    conn = get_conn()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("SELECT id FROM users WHERE username=%s", (session['username'],))
+    user_id = cursor.fetchone()['id']
+
+    cursor.execute("SELECT author FROM recipes WHERE id=%s", (recipe_id,))
+    author = cursor.fetchone()['author']
+
+    if author != user_id:
         flash("You can only delete your own recipes!")
-        return redirect(url_for('home'))
+        return redirect(url_for("home"))
 
+    cursor.execute("DELETE FROM recipes WHERE id=%s", (recipe_id,))
 
-'''
-USER ROUTES
-'''
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-
-# Login
-@app.route("/login",  methods=['GET', 'POST'])
-def login():
-    '''
-    The login function calls LoginForm class from forms.py,
-    It checks if the entered username and passwords are valid
-    and then add user to session.
-    '''
-    # Check if the user is already logged in
-    if 'username' in session:
-        flash('You are already logged in!')
-        return redirect(url_for('home'))
-    form = LoginForm()
-    if form.validate_on_submit():
-        # Variable for users collection
-        users = users_coll
-        registered_user = users.find_one({'username':
-                                          request.form['username']})
-
-        if registered_user:
-            # Check if password in the form is equal to the password in the DB
-            if check_password_hash(registered_user['password'],
-                                   request.form['password']):
-                # Add user to session if passwords match
-                session['username'] = request.form['username']
-                flash('You have been successfully logged in!')
-                return redirect(url_for('home'))
-            else:
-                # if user entered incorrect password
-                flash("Incorrect username or password. Please try again")
-                return redirect(url_for('login'))
-        else:
-            # if user entered incorrect username
-            flash("Username does not exist! Please try again")
-            return redirect(url_for('login'))
-    return render_template('login.html',  form=form, title='Login')
-
-
-# Register
-@app.route("/register", methods=['GET', 'POST'])
-def register():
-    '''
-    CREATE.
-    Creates a new account; it calls the RegisterForm class from forms.py.
-    Checks if the username is not already excist in database,
-    hashes the entered password and add a new user to session.
-    '''
-    # checks if user is not already logged in
-    if 'username' in session:
-        flash('You are already registered!')
-        return redirect(url_for('home'))
-
-    form = RegisterForm()
-    if form.validate_on_submit():
-        # variable for users collection
-        users = users_coll
-        # checks if the username is unique
-        registered_user = users_coll.find_one({'username':
-                                               request.form['username']})
-        if registered_user:
-            flash("Sorry, this username is already taken!")
-            return redirect(url_for('register'))
-        else:
-            # hashes the entered password
-            hashed_password = generate_password_hash(request.form['password'])
-            new_user = {
-                "username": request.form['username'],
-                "password": hashed_password,
-                "user_recipes": [],
-            }
-            users.insert_one(new_user)
-            # add new user to the session
-            session["username"] = request.form['username']
-            flash('Your account has been successfully created.')
-            return redirect(url_for('home'))
-    return render_template('register.html', form=form,  title='Register')
-
-
-# Logout
-@app.route("/logout")
-def logout():
-    '''
-    Logs user out and redirects to home
-    '''
-    session.pop("username",  None)
+    flash("Recipe deleted.")
     return redirect(url_for("home"))
 
 
-# Account Settings
+# ------------------------------------------------
+# LOGIN
+# ------------------------------------------------
+@app.route("/login", methods=['GET', 'POST'])
+def login():
+    if 'username' in session:
+        flash("Already logged in!")
+        return redirect(url_for('home'))
+
+    form = LoginForm()
+
+    if form.validate_on_submit():
+        conn = get_conn()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute("SELECT * FROM users WHERE username=%s",
+                       (request.form['username'],))
+        registered_user = cursor.fetchone()
+
+        if registered_user and check_password_hash(registered_user['password'],
+                                                  request.form['password']):
+            session['username'] = registered_user['username']
+            flash("Login successful!")
+            return redirect(url_for('home'))
+        else:
+            flash("Incorrect username or password")
+
+        cursor.close()
+        conn.close()
+
+    return render_template('login.html', form=form, title='Login')
+
+
+# ------------------------------------------------
+# REGISTER
+# ------------------------------------------------
+@app.route("/register", methods=['GET', 'POST'])
+def register():
+    if 'username' in session:
+        flash("Already registered!")
+        return redirect(url_for('home'))
+
+    form = RegisterForm()
+
+    if form.validate_on_submit():
+        conn = get_conn()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute("SELECT * FROM users WHERE username=%s",
+                       (request.form['username'],))
+        registered_user = cursor.fetchone()
+
+        if registered_user:
+            flash("Username already taken!")
+            return redirect(url_for('register'))
+
+        hashed_password = generate_password_hash(request.form['password'])
+
+        cursor.execute("""
+            INSERT INTO users (username, password)
+            VALUES (%s,%s)
+        """, (request.form['username'], hashed_password))
+        conn.commit()
+
+        session['username'] = request.form['username']
+        flash("Account created!")
+
+        cursor.close()
+        conn.close()
+
+        return redirect(url_for('home'))
+
+    return render_template('register.html', form=form, title='Register')
+
+
+# ------------------------------------------------
+# LOGOUT
+# ------------------------------------------------
+@app.route("/logout")
+def logout():
+    session.pop("username", None)
+    return redirect(url_for("home"))
+
+
+# ------------------------------------------------
+# ACCOUNT SETTINGS
+# ------------------------------------------------
 @app.route("/account_settings/<username>")
 def account_settings(username):
-    '''
-    Account settings page - displays username,
-    buttons for change_username, change_password
-    and delete_account pages.
-    '''
-    # prevents guest users from viewing the page
     if 'username' not in session:
-        flash('You must be logged in to view that page!')
-    username = users_coll.find_one({'username':
-                                    session['username']})['username']
-    return render_template('account_settings.html',
-                           username=username, title='Account Settings')
+        flash("Login required!")
+        return redirect(url_for("home"))
+
+    return render_template("account_settings.html",
+                           username=session['username'],
+                           title="Account Settings")
 
 
-# Change username
-@app.route("/change_username/<username>", methods=['GET', 'POST'])
+# ------------------------------------------------
+# CHANGE USERNAME
+# ------------------------------------------------
+@app.route("/change_username/<username>", methods=["GET", "POST"])
 def change_username(username):
-    '''
-    UPDATE.
-    Allows user to change the current username.
-    It calls the ChangeUsernameForm class from forms.py.
-    Checks if the new username is unique and not exist in database,
-    then clear the session and redirect user to login page.
-    '''
-    # prevents guest users from viewing the form
     if 'username' not in session:
-        flash('You must be logged in to change username!')
-    users = users_coll
+        flash("Login required!")
+        return redirect(url_for("home"))
+
     form = ChangeUsernameForm()
+
+    conn = get_conn()
+    cursor = conn.cursor(dictionary=True)
+
     if form.validate_on_submit():
-        # checks if the new username is unique
-        registered_user = users.find_one({'username':
-                                         request.form['new_username']})
-        if registered_user:
-            flash('Sorry, username is already taken. Try another one')
-            return redirect(url_for('change_username',
-                                    username=session["username"]))
-        else:
-            users.update_one(
-                {"username": username},
-                {"$set": {"username": request.form["new_username"]}})
-        # clear the session and redirect to login page
-        flash("Your username was updated successfully.\
-                    Please, login with your new username")
-        session.pop("username",  None)
+
+        cursor.execute("SELECT * FROM users WHERE username=%s",
+                       (request.form['new_username'],))
+        exists = cursor.fetchone()
+        if exists:
+            flash("Username already taken!")
+            return redirect(url_for('change_username', username=username))
+
+        cursor.execute("""
+            UPDATE users SET username=%s WHERE username=%s
+        """, (request.form['new_username'], username))
+        conn.commit()
+
+        cursor.close()
+        conn.close()
+
+        session.pop("username", None)
+        flash("Username updated. Please login again.")
         return redirect(url_for("login"))
 
-    return render_template('change_username.html',
-                           username=session["username"],
-                           form=form, title='Change Username')
+    return render_template("change_username.html",
+                           form=form,
+                           username=username,
+                           title="Change Username")
 
 
-# Change password
-@app.route("/change_password/<username>", methods=['GET', 'POST'])
+# ------------------------------------------------
+# CHANGE PASSWORD
+# ------------------------------------------------
+@app.route("/change_password/<username>", methods=["GET", "POST"])
 def change_password(username):
-    '''
-    UPDATE.
-    Allows user to change the current password.
-    It calls the ChangePasswordForm class from forms.py.
-    Checks if the current password is correct, validate new password.
-    Then if new password matchs confirm password field,
-    insert it to the database.
-    '''
-    # prevents guest users from viewing the form
     if 'username' not in session:
-        flash('You must be logged in to change password!')
-    users = users_coll
-    form = ChangePasswordForm()
-    username = users.find_one({'username': session['username']})['username']
-    old_password = request.form.get('old_password')
-    new_password = request.form.get('new_password')
-    confirm_password = request.form.get("confirm_new_password")
-    if form.validate_on_submit():
-        # checks if current password matches existing password in database
-        if check_password_hash(users.find_one({'username': username})
-                               ['password'], old_password):
-            # checks if new passwords match
-            if new_password == confirm_password:
-                # update the password and redirect to the settings page
-                users.update_one({'username': username},
-                                 {'$set': {'password': generate_password_hash
-                                           (request.form['new_password'])}})
-                flash("Success! Your password was updated.")
-                return redirect(url_for('account_settings', username=username))
-            else:
-                flash("New passwords do not match! Please try again")
-                return redirect(url_for("change_password",
-                                        username=session["username"]))
-        else:
-            flash('Incorrect original password! Please try again')
-            return redirect(url_for('change_password',
-                            username=session["username"]))
-    return render_template('change_password.html', username=username,
-                           form=form, title='Change Password')
-
-
-# Delete Account
-@app.route("/delete_account/<username>", methods=['GET', 'POST'])
-def delete_account(username):
-    '''
-    DELETE.
-    Remove user's account from the database as well as all recipes
-    created by this user. Before deletion of the account, user is asked
-    to confirm it by entering password.
-    '''
-    # prevents guest users from viewing the form
-    if 'username' not in session:
-        flash('You must be logged in to delete an account!')
-    user = users_coll.find_one({"username": username})
-    # checks if password matches existing password in database
-    if check_password_hash(user["password"],
-                           request.form.get("confirm_password_to_delete")):
-        # Removes all user's recipes from the Database
-        all_user_recipes = user.get("user_recipes")
-        for recipe in all_user_recipes:
-            recipes_coll.remove({"_id": recipe})
-        # remove user from database,clear session and redirect to the home page
-        flash("Your account has been deleted.")
-        session.pop("username", None)
-        users_coll.remove({"_id": user.get("_id")})
+        flash("Login required!")
         return redirect(url_for("home"))
-    else:
-        flash("Password is incorrect! Please try again")
+
+    form = ChangePasswordForm()
+
+    conn = get_conn()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("SELECT * FROM users WHERE username=%s", (username,))
+    user = cursor.fetchone()
+
+    if form.validate_on_submit():
+        old = request.form.get("old_password")
+        new = request.form.get("new_password")
+        confirm = request.form.get("confirm_new_password")
+
+        if not check_password_hash(user['password'], old):
+            flash("Incorrect old password!")
+            return redirect(url_for('change_password', username=username))
+
+        if new != confirm:
+            flash("New passwords do not match!")
+            return redirect(url_for('change_password', username=username))
+
+        cursor.execute("""
+            UPDATE users SET password=%s WHERE username=%s
+        """, (generate_password_hash(new), username))
+        conn.commit()
+
+        cursor.close()
+        conn.close()
+
+        flash("Password updated!")
+        return redirect(url_for('account_settings', username=username))
+
+    return render_template("change_password.html",
+                           form=form,
+                           username=username,
+                           title="Change Password")
+
+
+# ------------------------------------------------
+# DELETE ACCOUNT
+# ------------------------------------------------
+@app.route("/delete_account/<username>", methods=["POST"])
+def delete_account(username):
+    if "username" not in session:
+        flash("Login required!")
+        return redirect(url_for("home"))
+
+    conn = get_conn()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("SELECT * FROM users WHERE username=%s", (username,))
+    user = cursor.fetchone()
+
+    if not check_password_hash(
+        user["password"], request.form.get("confirm_password_to_delete")
+    ):
+        flash("Incorrect password!")
         return redirect(url_for("account_settings", username=username))
 
+    cursor.execute("DELETE FROM recipes WHERE author=%s", (user["id"],))
+    cursor.execute("DELETE FROM users WHERE id=%s", (user["id"],))
+    conn.commit()
 
-'''
-ERROR HANDLERS
-'''
+    cursor.close()
+    conn.close()
 
-@app.errorhandler(404)
-def error_404(error):
-    '''
-    Handles 404 error (page not found)
-    '''
-    return render_template('errors/404.html', error=True,
-                           title="Page not found"), 404
+    session.pop("username", None)
+    flash("Account deleted.")
+    return redirect(url_for("home"))
 
 
-@app.errorhandler(500)
-def error_500(error):
-    '''
-    Handles 500 error (internal server error)
-    '''
-    return render_template('errors/500.html', error=True,
-                           title="Internal Server Error"), 500
-
-
+# ------------------------------------------------
+# SEARCH (SQL VERSION)
+# ------------------------------------------------
 @app.route("/search")
 def search():
-    """
-    A function that finds recipes on query
-    The query is the user's input
-    Recipes are a list of user queries
-    Render user's list recipes on search.html
-    """
-
+    query = request.args.get("query", "")
     limit_per_page = 8
     current_page = int(request.args.get('current_page', 1))
 
-    query = request.args.get('query')
+    conn = get_conn()
+    cursor = conn.cursor(dictionary=True)
 
-    #  create the index
-    recipes_coll.create_index( [("$**", 'text')] )
+    search_sql = """
+        SELECT * FROM recipes
+        WHERE recipe_name LIKE %s OR description LIKE %s
+        ORDER BY id ASC
+        LIMIT %s OFFSET %s
+    """
 
-    #  Search results
-    results = \
-        recipes_coll.find({'$text': {'$search': str(query)}},
-                          {'score': {'$meta': 'textScore'}}).sort('_id'
-            , pymongo.ASCENDING).skip((current_page - 1)
-            * limit_per_page).limit(limit_per_page)
+    like = f"%{query}%"
 
-    # Pagination
-    number_of_recipes_found = recipes_coll.find({'$text': {'$search': str(query)}}).count()
-    
-    results_pages = range(1, int(math.ceil(number_of_recipes_found / limit_per_page)) + 1)
-    total_pages = int(math.ceil(number_of_recipes_found / limit_per_page))
+    cursor.execute("SELECT COUNT(*) AS total FROM recipes WHERE recipe_name LIKE %s OR description LIKE %s",
+                   (like, like))
+    total = cursor.fetchone()['total']
 
-    return render_template("search.html",
-                            title='Search',
-                            limit_per_page=limit_per_page,
-                            number_of_recipes_found = number_of_recipes_found,
-                            current_page=current_page,
-                            query=query,
-                            results=results,
-                            results_pages=results_pages,
-                            total_pages=total_pages)
+    cursor.execute(search_sql, (like, like, limit_per_page, (current_page - 1) * limit_per_page))
+    results = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    pages = range(1, int(math.ceil(total / limit_per_page)) + 1)
+
+    return render_template(
+        "search.html",
+        title="Search",
+        query=query,
+        results=results,
+        number_of_recipes_found=total,
+        current_page=current_page,
+        results_pages=pages,
+        total_pages=len(pages)
+    )
